@@ -3146,3 +3146,19 @@ async function reloadChatMessages(page, contactId, contact) {
     logger.info('phone','[ChatView] 消息已重新加载');
   }
 }
+
+/**
+ * 外部数据操作（例如导入聊天记录）后刷新该角色的聊天页。
+ * 页面不存在时返回 false，等用户下次打开聊天时自然会读取最新记录。
+ *
+ * @param {string} contactId - 联系人 ID
+ * @returns {Promise<boolean>} 是否找到并刷新了页面
+ */
+export async function refreshChatHistoryPage(contactId) {
+  const sanitizedId = contactId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const page = document.getElementById(`page-chat-${sanitizedId}`);
+  if (!page) return false;
+
+  await reloadChatMessages(page, contactId, null);
+  return true;
+}

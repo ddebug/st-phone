@@ -8,6 +8,12 @@ import { loadContacts } from '../contacts/contact-list-data.js';
 import { getContactDisplayName } from '../utils/contact-display-helper.js';
 import { getThumbnailUrl } from '/script.js';
 import { getChatSendSettings } from './message-chat-data.js';
+import {
+  createChatTransfer,
+  mergeChatHistory,
+  parseChatTransferText,
+  MAX_CHAT_TRANSFER_BYTES,
+} from './chat-history-transfer.js';
 
 /**
  * 渲染聊天设置页
@@ -268,6 +274,27 @@ function createSettingsList(contact) {
             </div>
         </div>
 
+        <!-- 聊天记录迁移 -->
+        <div class="chat-settings-section-title">聊天记录迁移</div>
+
+        <div class="chat-settings-item" data-action="export-chat-history">
+            <span class="chat-settings-item-label">导出聊天记录</span>
+            <div class="chat-settings-item-right">
+                <span class="chat-settings-item-text">JSON</span>
+                <i class="fa-solid fa-download"></i>
+            </div>
+        </div>
+
+        <div class="chat-settings-item" data-action="import-chat-history">
+            <span class="chat-settings-item-label">导入聊天记录</span>
+            <div class="chat-settings-item-right">
+                <span class="chat-settings-item-text">JSON</span>
+                <i class="fa-solid fa-upload"></i>
+            </div>
+        </div>
+        <input type="file" class="chat-history-import-input" accept=".json,application/json" hidden>
+        <div class="chat-settings-item-desc">导出为单个角色的聊天 JSON。可在此处导入回当前角色：相同消息自动跳过，不覆盖现有记录。图片仅保留引用，不随文件打包。</div>
+
         <!-- 删除聊天记录 -->
         <div class="chat-settings-item" data-action="delete-history">
             <span class="chat-settings-item-label">删除聊天记录</span>
@@ -356,6 +383,24 @@ function bindSettingsEvents(list, contact) {
   // 设置当前聊天背景（链接）
   list.querySelector('[data-action="set-background"]').addEventListener('click', () => {
     handleSetBackground(contact);
+  });
+
+  // 导出 / 导入聊天记录
+  list.querySelector('[data-action="export-chat-history"]').addEventListener('click', () => {
+    handleExportChatHistory(contact);
+  });
+
+  const importInput = /** @type {HTMLInputElement} */ (list.querySelector('.chat-history-import-input'));
+  list.querySelector('[data-action="import-chat-history"]').addEventListener('click', () => {
+    importInput.value = '';
+    importInput.click();
+  });
+  importInput.addEventListener('change', async (event) => {
+    const input = /** @type {HTMLInputElement} */ (event.currentTarget);
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    await handleImportChatHistory(contact, file);
   });
 
   // 删除聊天记录（链接）
@@ -571,6 +616,172 @@ async function handleSetBackground(contact) {
       contactId: contact.id
     });
   }
+}
+
+/**
+ * 导出当前角色的聊天记录
+ * @param {Object} contact - 联系人对象
+ */
+async function handleExportChatHistory(contact) {
+  logger.info('phone','[ChatSettings] 导出聊天记录:', contact.id);
+
+  try {
+    const { loadChatHistory } = await import('./message-chat-data.js');
+    const messages = await loadChatHistory(contact.id);
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      const { showInfoToast } = await import('../ui-components/toast-notification.js');
+      showInfoToast('当前角色还没有聊天记录');
+      return;
+    }
+
+    const displayName = getContactDisplayName(contact);
+    const payload = createChatTransfer({
+      contact: {
+        id: contact.id,
+        name: displayName,
+        avatar: contact.avatar || '',
+      },
+      messages,
+    });
+
+    downloadChatTransferFile(payload, displayName);
+
+    const { showSuccessToast } = await import('../ui-components/toast-notification.js');
+    showSuccessToast(`已导出 ${payload.messageCount} 条聊天记录`);
+    logger.info('phone','[ChatSettings] 聊天记录导出完成:', contact.id, payload.messageCount);
+  } catch (error) {
+    logger.error('phone','[ChatSettings] 导出聊天记录失败:', error);
+    const { showErrorToast } = await import('../ui-components/toast-notification.js');
+    showErrorToast(`导出失败：${error instanceof Error ? error.message : '未知错误'}`);
+  }
+}
+
+/**
+ * 导入聊天记录到当前角色
+ * @param {Object} contact - 联系人对象
+ * @param {File} file - 用户选择的 JSON 文件
+ */
+async function handleImportChatHistory(contact, file) {
+  logger.info('phone','[ChatSettings] 导入聊天记录:', contact.id, file.name);
+
+  if (file.size > MAX_CHAT_TRANSFER_BYTES) {
+    const { showErrorToast } = await import('../ui-components/toast-notification.js');
+    showErrorToast('导入失败：文件超过 32 MiB，请先拆分或整理聊天记录');
+    return;
+  }
+
+  try {
+    const text = await file.text();
+    const transfer = parseChatTransferText(text);
+
+    if (transfer.messages.length === 0) {
+      const { showInfoToast } = await import('../ui-components/toast-notification.js');
+      showInfoToast('导入文件里没有聊天消息');
+      return;
+    }
+
+    const displayName = getContactDisplayName(contact);
+    const { loadChatHistory } = await import('./message-chat-data.js');
+    const currentMessages = await loadChatHistory(contact.id);
+    const preview = mergeChatHistory(currentMessages, transfer.messages);
+
+    if (preview.addedCount === 0) {
+      const { showInfoToast } = await import('../ui-components/toast-notification.js');
+      showInfoToast('没有新增消息：文件中的消息都已存在');
+      return;
+    }
+
+    const { showConfirmPopup } = await import('../utils/popup-helper.js');
+    let detail = `来自「${escapeHtml(transfer.character.name)}」，共 ${transfer.messageCount} 条消息。<br>`
+      + `将合并到「${escapeHtml(displayName)}」：新增 ${preview.addedCount} 条，跳过重复 ${preview.skippedCount} 条。`;
+    if (transfer.character.id !== contact.id) {
+      detail += '<br>注意：文件中的角色与当前角色不同，消息仍会导入当前角色。';
+    }
+
+    const confirmed = await showConfirmPopup('导入聊天记录', detail, { okButton: '合并导入' });
+    if (!confirmed) {
+      logger.debug('phone','[ChatSettings] 用户取消导入聊天记录');
+      return;
+    }
+
+    // 弹窗期间可能有新消息写入，确认后重新读取再合并，避免覆盖刚刚到达的消息。
+    const latestMessages = await loadChatHistory(contact.id);
+    const merged = mergeChatHistory(latestMessages, transfer.messages);
+    if (merged.addedCount === 0) {
+      const { showInfoToast } = await import('../ui-components/toast-notification.js');
+      showInfoToast('没有新增消息：文件中的消息都已存在');
+      return;
+    }
+
+    const { saveChatHistory } = await import('./message-chat-data.js');
+    await saveChatHistory(contact.id, merged.messages);
+
+    try {
+      const { updateContactItem } = await import('./message-list-ui.js');
+      await updateContactItem(contact.id);
+      const { refreshChatHistoryPage } = await import('./message-chat-ui.js');
+      await refreshChatHistoryPage(contact.id);
+    } catch (refreshError) {
+      // 导入已经落盘；刷新失败只影响当前画面，不把导入结果当作失败。
+      logger.warn('phone','[ChatSettings] 导入后刷新聊天页失败:', refreshError);
+    }
+
+    const { showSuccessToast } = await import('../ui-components/toast-notification.js');
+    showSuccessToast(`已导入 ${merged.addedCount} 条聊天记录，跳过 ${merged.skippedCount} 条重复`);
+    logger.info('phone','[ChatSettings] 聊天记录导入完成:', contact.id, merged.addedCount, merged.skippedCount);
+  } catch (error) {
+    logger.error('phone','[ChatSettings] 导入聊天记录失败:', error);
+    const { showErrorToast } = await import('../ui-components/toast-notification.js');
+    showErrorToast(`导入失败：${error instanceof Error ? error.message : '未知错误'}`);
+  }
+}
+
+/**
+ * 触发单角色聊天 JSON 下载。
+ * @param {Object} payload - createChatTransfer 的返回值
+ * @param {string} displayName - 角色显示名
+ */
+function downloadChatTransferFile(payload, displayName) {
+  const json = JSON.stringify(payload, null, 2) + '\n';
+  const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  link.href = url;
+  link.download = `acsus-chat-${safeFilePart(displayName)}-${stamp}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function safeFilePart(value) {
+  return String(value || 'chat')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 40) || 'chat';
+}
+
+/**
+ * 转义要放进确认弹窗 HTML 的用户数据。
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char] || char));
 }
 
 /**
